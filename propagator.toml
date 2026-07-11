@@ -1,0 +1,22 @@
+[store]
+path = ".propagator/store.bin"
+
+[[sources]]
+kind = "sql"
+path = "fixtures/sql"
+service = "oms-core"
+
+[[sources]]
+kind = "code"
+path = "fixtures/go"
+service = "risk-engine"
+
+[[sources]]
+kind = "code"
+path = "fixtures/rust"
+service = "order-gateway"
+
+[[sources]]
+kind = "code"
+path = "fixtures/cpp"
+service = "clearing-bridge"

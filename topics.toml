@@ -1,0 +1,4 @@
+# Registry fallback untuk topic dinamis yang regex nggak bisa resolve (plan §6.3).
+# settlement-svc nggak punya source di propagator.toml — murni dari registry.
+[settlement-svc]
+consumes = ["settlements"]
