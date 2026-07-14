@@ -336,6 +336,24 @@ Two rules when reading a benchmark table:
 Call a configuration "worth it" only when it is *both* cheaper (or
 comparable) *and* at least as correct on the judged result.
 
+### A/B results — MCP (propagator + braket) vs no-MCP (grep / code reading)
+
+Three representative tasks, judged `status=done` only (failed/timed-out
+runs excluded per rule 1 above). *Negative Δ = MCP is cheaper.*
+
+| task | arm | n | avg cost | Δcost% | verdict |
+|------|-----|---|----------|--------|---------|
+| cross-service-impact | mcp | 4 | $0.6146 | **−20.1 %** ✅ | cheaper |
+| cross-service-impact | nomcp | 1 | $0.7689 | — | — |
+| orderservice-callers | mcp | 5 | $0.2706 | **−31.8 %** ✅ | cheaper |
+| orderservice-callers | nomcp | 5 | $0.3966 | — | — |
+| risk-limit-search | mcp | 5 | $0.3984 | **−32.8 %** ✅ | cheaper |
+| risk-limit-search | nomcp | 5 | $0.5926 | — | — |
+
+MCP is cheaper by 20–33 % on every task while producing comparable
+output tokens (±15 %), confirming that graph traversal replaces
+broad-grep exploration with fewer, higher-signal tool calls.
+
 ---
 
 ## Decision log (ADRs)
