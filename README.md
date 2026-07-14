@@ -341,18 +341,73 @@ comparable) *and* at least as correct on the judged result.
 Three representative tasks, judged `status=done` only (failed/timed-out
 runs excluded per rule 1 above). *Negative Δ = MCP is cheaper.*
 
-| task | arm | n | avg cost | Δcost% | verdict |
-|------|-----|---|----------|--------|---------|
-| cross-service-impact | mcp | 4 | $0.6146 | **−20.1 %** ✅ | cheaper |
-| cross-service-impact | nomcp | 1 | $0.7689 | — | — |
-| orderservice-callers | mcp | 5 | $0.2706 | **−31.8 %** ✅ | cheaper |
-| orderservice-callers | nomcp | 5 | $0.3966 | — | — |
-| risk-limit-search | mcp | 5 | $0.3984 | **−32.8 %** ✅ | cheaper |
-| risk-limit-search | nomcp | 5 | $0.5926 | — | — |
+| task | arm | n | avg cost | Δcost% | avg cache_read | cache_hit | verdict |
+|------|-----|---|----------|--------|----------------|-----------|---------|
+| cross-service-impact | mcp | 4 | $0.6146 | **−20.1 %** ✅ | 661 687 | 94 % | cheaper |
+| cross-service-impact | nomcp | 1 | $0.7689 | — | 1 223 839 | 96 % | — |
+| orderservice-callers | mcp | 5 | $0.2706 | **−31.8 %** ✅ | 309 094 | 94 % | cheaper |
+| orderservice-callers | nomcp | 5 | $0.3966 | — | 557 097 | 93 % | — |
+| risk-limit-search | mcp | 5 | $0.3984 | **−32.8 %** ✅ | 462 125 | 92 % | cheaper |
+| risk-limit-search | nomcp | 5 | $0.5926 | — | 633 396 | 91 % | — |
 
 MCP is cheaper by 20–33 % on every task while producing comparable
 output tokens (±15 %), confirming that graph traversal replaces
 broad-grep exploration with fewer, higher-signal tool calls.
+
+The savings show up in **cache reads** too: MCP arms re-read 27–46 %
+fewer cached prompt tokens per task (`avg cache_read`). Fewer, targeted
+MCP calls mean a smaller, tighter context window — so less of the system
+prompt + earlier turns needs to be replayed from the prompt cache on each
+turn. Both arms keep a high cache-hit rate (91–96 %), so the MCP win is
+*less volume to re-read*, not *better cache warmth*.
+
+#### Deep dive — `cross-service-impact` (the counter-intuitive one)
+
+This task is worth a closer look because it breaks the naive "fewer
+tokens = cheaper" expectation. Full per-arm breakdown:
+
+| metric | mcp | nomcp | Δ (mcp vs nomcp) |
+|--------|-----|-------|------------------|
+| n (done runs) | 4 | 1 | — |
+| avg out (tokens) | 11 546 | 8 140 | **+41.8 %** (mcp talks *more*) |
+| avg in (tokens) | 53 | 181 | **−70.7 %** |
+| avg cache_read (tokens) | 661 687 | 1 223 839 | **−45.9 %** |
+| cache_hit | 94 % | 96 % | −2 pp |
+| avg tools | 25.8 | 31.0 | −16.8 % |
+| avg turns | 26.8 | 32.0 | −16.3 % |
+| avg cost | $0.6146 | $0.7689 | **−20.1 %** |
+
+**The interesting part:** the MCP arm is *cheaper* even though it emits
+**41.8 % more output tokens** (11 546 vs 8 140). The cheaper arm is
+actually doing *more* work — writing up a fuller structured blast radius.
+
+How can more output cost less? Because the bill is dominated by
+**cache reads**, not output. The nomcp arm re-reads **1.22 M** cached
+tokens per task; MCP re-reads only **662 k** — a **561 k-token** cut.
+At the prompt-cache read rate, those avoided re-reads swamp the extra
+output the model produces. In short: *output is the cheap direction;
+cache-replayed context is the expensive one.*
+
+Why does MCP accumulate less cache? Two compounding effects:
+
+1. **Smaller tool results.** `avg in` is 53 tokens for MCP vs 181 for
+   nomcp. A `get_impact` call returns a packed graph answer; a grep /
+   read-file call dumps raw source back into context. Every turn that
+   appended result stays in the window and gets **re-read from cache on
+   every subsequent turn**. Smaller appends → a context that grows
+   slower → less to replay each turn.
+2. **Fewer turns.** 26.8 vs 32.0. Fewer round-trips mean the cumulative
+   context is replayed fewer times total.
+
+`cache_hit` is actually *lower* for MCP (94 % vs 96 %) — so this is not
+"better cache warmth". It is purely **less volume re-read**, which is
+what the cost curve rewards.
+
+> ⚠️ **Caveat on `n`.** Only **1** nomcp run reached `status=done` for
+> this task (the others missed callers / timed out). Its numbers are a
+> single sample, so treat the nomcp column here as indicative, not
+> stable. The two simpler tasks (n = 5 vs 5) corroborate the same
+> direction with firmer samples.
 
 ---
 
