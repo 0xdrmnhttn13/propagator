@@ -103,14 +103,14 @@ store: ~/work/.propagator/store.bin
 ### 4. Query — find out what's connected
 
 ```bash
-# Who calls SPI_CHECKBUYLIMIT (and who calls THEM)?
-propagator callers SPI_CHECKBUYLIMIT --depth 2
+# Who calls func_buy (and who calls THEM)?
+propagator callers func_buy --depth 2
 
-# What does USP_NEW_ORDER_V16 depend on?
-propagator deps USP_NEW_ORDER_V16
+# What does func_new_order depend on?
+propagator deps func_new_order
 
 # Blast radius: everything impacted if this table changes
-propagator impact TORDER --depth 5
+propagator impact order --depth 5
 
 # Who produces / consumes this Kafka topic?
 propagator topic order-events
@@ -169,18 +169,18 @@ AI coding assistant can query the graph directly — no context switching.
 #### Example session
 
 ```
-You:     I need to change the TORDER table. What will be impacted?
+You:     I need to change the order table. What will be impacted?
 
-AI:      → get_impact TORDER (depth 5)
+AI:      → get_impact order (depth 5)
 
-         d1: [SPI_NEW_ORDER:Procedure via:Touches; SPI_AMEND:Procedure via:Touches]
+         d1: [new-order:Procedure via:Touches; amen:Procedure via:Touches]
          d2: [risk-service:Service via:Invokes; ...]
-         d3: [DEV-OUTBOUND-POSTRMS:Topic via:Publishes]
-         d4: [auto-order-service:Service via:Consumes]
+         d3: [out-topic:Topic via:Publishes]
+         d4: [order-service:Service via:Consumes]
 
-         "Changing TORDER impacts 2 stored procedures, which propagate
-          through risk-service to the DEV-OUTBOUND-POSTRMS topic, which
-          is consumed by auto-order-service."
+         "Changing order impacts 2 stored procedures, which propagate
+          through risk-service to the out-topic topic, which
+          is consumed by order-service."
 ```
 
 ---
@@ -247,10 +247,10 @@ crosses the `Publishes` edge for tables in the list.
 
 ```toml
 [risk-service]
-publishes = ["DEV-OUTBOUND-POSTRMS"]
+publishes = ["out-topic"]
 
 [risk-service.provenance]
-"DEV-OUTBOUND-POSTRMS" = ["TORDER", "TTRADE"]
+"DEV-OUTBOUND-POSTRMS" = ["order", "trade"]
 ```
 
 - **Non-empty list = whitelist** → tables outside the list do NOT flow to this topic's consumers.
