@@ -12,6 +12,14 @@
 //!     call + its key argument. One per idiom:
 //!       * **Go / go-redis** — `rdb.Verb(ctx, key, …)` (method verb). Full key
 //!         ladder incl. local `var → pattern` resolution. Corpus-validated.
+//!         Plus **auto-inferred project wrappers**: a service that hides go-redis
+//!         behind its own helper (`repo.GeneralRedisGet(key)` →
+//!         `rc.redis.Get(ctx, key)`) would otherwise go blind. [`discover_wrappers`]
+//!         scans every method/func body in the service for a passthrough to a
+//!         known verb whose key argument is one of the wrapper's own parameters,
+//!         yielding `name → (verb, key-arg index)`. Call sites of those names are
+//!         then recognized like native verbs — no per-project config. This is a
+//!         *service-scoped* two-pass: discover across all files, then recognize.
 //!       * **Rust / redis-rs** — `cmd("GET").arg(key)` and turbofish
 //!         `con.get::<_,T>(key)`. Unit-validated (no Rust Redis in the corpus yet).
 //!       * **C++ / hiredis** — `redisCommand(c, "GET key:%s", …)` (verb+key live
@@ -139,14 +147,94 @@ fn verb_class(verb: &str) -> Option<EdgeKind> {
     }
 }
 
+/// A service-scoped registry of auto-inferred redis wrapper methods:
+/// `wrapper-method-name → (access kind, index of the key argument)`. Built by
+/// [`discover_wrappers`] before call-site recognition runs.
+pub type RedisWrappers = HashMap<String, (EdgeKind, usize)>;
+
 /// Entry point. `root` is the already-parsed tree root (one parse per file,
-/// shared with `code.rs`). Dispatches to the per-language front-end.
-pub fn scan(lang: Lang, root: Node, src: &[u8], service: &str, path: &str, out: &mut Extraction) {
+/// shared with `code.rs`). Dispatches to the per-language front-end. `wrappers`
+/// carries service-scoped inferred wrappers (Go only; empty for other langs).
+pub fn scan(
+    lang: Lang,
+    root: Node,
+    src: &[u8],
+    service: &str,
+    path: &str,
+    wrappers: &RedisWrappers,
+    out: &mut Extraction,
+) {
     match lang {
-        Lang::Go => scan_go(root, src, service, path, out),
+        Lang::Go => scan_go(root, src, service, path, wrappers, out),
         Lang::Rust => scan_generic(root, src, service, path, out, rust_call),
         Lang::Cpp => scan_generic(root, src, service, path, out, cpp_call),
     }
+}
+
+/// Discovery pass (Go). Scan one file's method/function declarations for a body
+/// that passes one of its own parameters as the key to a native go-redis verb
+/// call, and record `name → (verb kind, param index)` into `out`. Run over every
+/// Go file in a service before call-site recognition — wrapper definition and
+/// use routinely live in different files of the same service.
+pub fn discover_wrappers(root: Node, src: &[u8], out: &mut RedisWrappers) {
+    if matches!(root.kind(), "method_declaration" | "function_declaration") {
+        if let (Some(name), Some(params), Some(body)) = (
+            root.child_by_field_name("name"),
+            root.child_by_field_name("parameters"),
+            root.child_by_field_name("body"),
+        ) {
+            if let Some((kind, key_node)) = first_go_redis_call(body, src) {
+                let key = text(key_node, src);
+                if let Some(idx) = param_names(params, src).iter().position(|p| *p == key) {
+                    out.entry(text(name, src)).or_insert((kind, idx));
+                }
+            }
+        }
+    }
+    let mut c = root.walk();
+    for child in root.children(&mut c) {
+        discover_wrappers(child, src, out);
+    }
+}
+
+/// Positional parameter identifier names of a Go `parameter_list`. A grouped
+/// declaration (`key, field string`) contributes both names in order; a variadic
+/// (`fields ...string`) contributes its single name. Type nodes (`type_identifier`,
+/// `qualified_type`, …) are not `identifier`, so they are skipped.
+fn param_names(params: Node, src: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut c = params.walk();
+    for decl in params.named_children(&mut c) {
+        if matches!(
+            decl.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            let mut cc = decl.walk();
+            for ch in decl.named_children(&mut cc) {
+                if ch.kind() == "identifier" {
+                    names.push(text(ch, src));
+                }
+            }
+        }
+    }
+    names
+}
+
+/// First native go-redis verb call in a subtree (pre-order), for wrapper body
+/// inspection.
+fn first_go_redis_call<'a>(node: Node<'a>, src: &[u8]) -> Option<(EdgeKind, Node<'a>)> {
+    if node.kind() == "call_expression" {
+        if let Some(hit) = go_redis_call(node, src) {
+            return Some(hit);
+        }
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        if let Some(hit) = first_go_redis_call(child, src) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 fn emit(
@@ -171,10 +259,17 @@ fn emit(
 // Go / go-redis front-end (with full local var ladder)
 // ---------------------------------------------------------------------------
 
-fn scan_go(root: Node, src: &[u8], service: &str, path: &str, out: &mut Extraction) {
+fn scan_go(
+    root: Node,
+    src: &[u8],
+    service: &str,
+    path: &str,
+    wrappers: &RedisWrappers,
+    out: &mut Extraction,
+) {
     let mut vars: HashMap<String, String> = HashMap::new();
     collect_key_vars(root, src, &mut vars);
-    walk_go_calls(root, src, &vars, service, path, out);
+    walk_go_calls(root, src, &vars, wrappers, service, path, out);
 }
 
 /// Pass 1 — record identifiers assigned a resolvable key pattern.
@@ -208,12 +303,16 @@ fn walk_go_calls(
     node: Node,
     src: &[u8],
     vars: &HashMap<String, String>,
+    wrappers: &RedisWrappers,
     service: &str,
     path: &str,
     out: &mut Extraction,
 ) {
     if node.kind() == "call_expression" {
-        if let Some((kind, key_node)) = go_redis_call(node, src) {
+        // Native go-redis verb first, then an inferred project wrapper.
+        if let Some((kind, key_node)) =
+            go_redis_call(node, src).or_else(|| go_wrapper_call(node, src, wrappers))
+        {
             match resolve_go_key(key_node, src, vars) {
                 Some(pattern) => emit(
                     out,
@@ -229,8 +328,28 @@ fn walk_go_calls(
     }
     let mut c = node.walk();
     for child in node.children(&mut c) {
-        walk_go_calls(child, src, vars, service, path, out);
+        walk_go_calls(child, src, vars, wrappers, service, path, out);
     }
+}
+
+/// An inferred wrapper call `recv.Wrapper(args…)` — verb + key-arg position come
+/// from [`discover_wrappers`]. Unlike a native verb call the key need not follow
+/// a `ctx` arg; its index is whatever the wrapper threads through to go-redis.
+fn go_wrapper_call<'a>(
+    call: Node<'a>,
+    src: &[u8],
+    wrappers: &RedisWrappers,
+) -> Option<(EdgeKind, Node<'a>)> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "selector_expression" {
+        return None;
+    }
+    let method = text(func.child_by_field_name("field")?, src);
+    let &(kind, idx) = wrappers.get(&method)?;
+    let key_node = call
+        .child_by_field_name("arguments")?
+        .named_child(idx as u32)?;
+    Some((kind, key_node))
 }
 
 /// go-redis `recv.Verb(ctx, key, …)` — `ctx`-first-arg discriminates it from
@@ -491,8 +610,22 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&tsl).unwrap();
         let tree = parser.parse(src, None).unwrap();
+        // Discover wrappers over the same file first (mirrors the service-wide
+        // pre-pass), then recognize call sites.
+        let mut wrappers = RedisWrappers::default();
+        if matches!(lang, Lang::Go) {
+            discover_wrappers(tree.root_node(), src.as_bytes(), &mut wrappers);
+        }
         let mut out = Extraction::default();
-        scan(lang, tree.root_node(), src.as_bytes(), "svc", "f", &mut out);
+        scan(
+            lang,
+            tree.root_node(),
+            src.as_bytes(),
+            "svc",
+            "f",
+            &wrappers,
+            &mut out,
+        );
         out
     }
     fn go(src: &str) -> Extraction {
@@ -530,6 +663,53 @@ func f(rdb *redis.Client, ctx context.Context, id string) {
         assert!(e(&out, EdgeKind::ReadsKey).contains(&"order:*:detail"));
         assert_eq!(out.dynamic_redis_keys, 2, "%s:%d + unknownVar → ledger");
         assert_eq!(out.edges[0].from_kind, Some(NodeKind::Service));
+    }
+
+    #[test]
+    fn go_inferred_wrapper_calls_resolve() {
+        // A service hides go-redis behind `GeneralRedis*` helpers. Discovery must
+        // infer verb + key-arg index from the passthrough body, so call sites
+        // (key as arg 0, no ctx; and ctx-first Del with key as arg 1) resolve.
+        let out = go(r#"package p
+func (rc *RedisClientRepo) GeneralRedisGet(key string) (string, error) {
+    return rc.redis.Get(context.Background(), key).Result()
+}
+func (rc *RedisClientRepo) GeneralRedisHGET(key, field string) string {
+    result, _ := rc.redis.HGet(context.Background(), key, field).Result()
+    return result
+}
+func (rc *RedisClientRepo) GeneralRedisDel(ctx context.Context, key string) {
+    rc.redis.Del(ctx, key)
+}
+func use(odu *Svc, id string) {
+    redisKey := "GTC:SetExpiryDatetoRedis:" + id
+    odu.r.GeneralRedisGet(redisKey)
+    odu.r.GeneralRedisHGET("STOCKRECOMMENDATION::static", "f")
+    odu.r.GeneralRedisDel(ctx, "auto_order_"+id)
+}"#);
+        let reads = e(&out, EdgeKind::ReadsKey);
+        assert!(
+            reads.contains(&"GTC:SetExpiryDatetoRedis:*"),
+            "wrapper Get with local-var key missed: {reads:?}"
+        );
+        assert!(
+            reads.contains(&"STOCKRECOMMENDATION::static"),
+            "wrapper HGET literal key missed: {reads:?}"
+        );
+        assert!(
+            e(&out, EdgeKind::WritesKey).contains(&"auto_order_*"),
+            "ctx-first wrapper Del (key at arg 1) missed"
+        );
+    }
+
+    #[test]
+    fn go_non_wrapper_method_not_inferred() {
+        // A same-shaped helper that never threads a param into a redis verb must
+        // NOT be registered as a wrapper — no phantom key edges from `Load`.
+        let out = go(r#"package p
+func (s *S) Load(key string) string { return s.cache[key] }
+func use(s *S) { s.Load("not-a-redis-key") }"#);
+        assert!(out.edges.is_empty(), "non-redis helper wrongly inferred");
     }
 
     #[test]

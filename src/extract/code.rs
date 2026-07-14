@@ -24,10 +24,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 use walkdir::WalkDir;
 
 use crate::extract::mq::{Lang, skip_dir};
+use crate::extract::redis::RedisWrappers;
 use crate::extract::{Extraction, RawEdge};
 use crate::model::{EdgeKind, NodeKind};
 
@@ -90,6 +91,11 @@ fn language(lang: Lang) -> tree_sitter::Language {
 /// Scan a code source root, emitting embedded-SQL `Touches`/`Invokes` edges.
 pub fn extract(root: &Path, service: &str) -> anyhow::Result<Extraction> {
     let mut out = Extraction::default();
+
+    // Parse every supported file once; keep (lang, path, src, tree) so redis
+    // wrapper discovery (a service-wide pre-pass) and the main per-file
+    // extraction share the same parse.
+    let mut parsed: Vec<(Lang, String, String, Tree)> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
@@ -110,29 +116,62 @@ pub fn extract(root: &Path, service: &str) -> anyhow::Result<Extraction> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let abs = path.to_string_lossy().to_string();
-        scan_file(lang, &src, service, &abs, &mut out);
+        let mut parser = Parser::new();
+        if parser.set_language(&language(lang)).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&src, None) else {
+            continue;
+        };
+        parsed.push((lang, path.to_string_lossy().to_string(), src, tree));
+    }
+
+    // Pass A — infer service-local redis wrappers (`GeneralRedisGet(key)` →
+    // `rc.redis.Get(ctx, key)`) across every Go file, since a wrapper's
+    // definition and its call sites usually live in different files.
+    let mut wrappers = RedisWrappers::default();
+    for (lang, _path, src, tree) in &parsed {
+        if matches!(lang, Lang::Go) {
+            crate::extract::redis::discover_wrappers(
+                tree.root_node(),
+                src.as_bytes(),
+                &mut wrappers,
+            );
+        }
+    }
+
+    // Pass B — per-file extraction (SQL + redis, now wrapper-aware).
+    for (lang, path, src, tree) in &parsed {
+        scan_tree(
+            *lang,
+            tree.root_node(),
+            src.as_bytes(),
+            service,
+            path,
+            &wrappers,
+            &mut out,
+        );
     }
     Ok(out)
 }
 
-/// Parse one file and emit edges from its embedded SQL. Parser failures (binary
-/// junk, unsupported syntax) are non-fatal — the file is simply skipped.
-fn scan_file(lang: Lang, src: &str, service: &str, path: &str, out: &mut Extraction) {
-    let mut parser = Parser::new();
-    if parser.set_language(&language(lang)).is_err() {
-        return;
-    }
-    let Some(tree) = parser.parse(src, None) else {
-        return;
-    };
-    let bytes = src.as_bytes();
+/// Emit edges from one already-parsed tree: embedded SQL (`Touches`/`Invokes`)
+/// plus redis key access. `wrappers` are the service's inferred redis helpers.
+fn scan_tree(
+    lang: Lang,
+    root: Node,
+    bytes: &[u8],
+    service: &str,
+    path: &str,
+    wrappers: &RedisWrappers,
+    out: &mut Extraction,
+) {
     // Redis key access shares this single parse (one parse per file). Its call
     // shape is library-specific, so it runs its own recognizer on the tree.
-    crate::extract::redis::scan(lang, tree.root_node(), bytes, service, path, out);
+    crate::extract::redis::scan(lang, root, bytes, service, path, wrappers, out);
 
     let mut strings: Vec<(String, usize)> = Vec::new();
-    collect_strings(tree.root_node(), bytes, string_kinds(lang), &mut strings);
+    collect_strings(root, bytes, string_kinds(lang), &mut strings);
 
     for (raw, line) in strings {
         let sql = normalize(&raw);
@@ -309,8 +348,20 @@ mod tests {
     use super::*;
 
     fn scan(lang: Lang, src: &str) -> Extraction {
+        let mut parser = Parser::new();
+        parser.set_language(&language(lang)).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let wrappers = RedisWrappers::default();
         let mut out = Extraction::default();
-        scan_file(lang, src, "svc", "f.x", &mut out);
+        scan_tree(
+            lang,
+            tree.root_node(),
+            src.as_bytes(),
+            "svc",
+            "f.x",
+            &wrappers,
+            &mut out,
+        );
         out
     }
 
