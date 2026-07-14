@@ -232,8 +232,8 @@ Declare them manually:
 
 ```toml
 [order-service]
-publishes = ["DEV_ORDER_INBOUND"]
-consumes  = ["DEV_ORDER_OUTBOUND_POSTRMS"]
+publishes = ["in-topic"]
+consumes  = ["out-topic"]
 ```
 
 ### Producer provenance — preventing false-positive "hubs"
@@ -250,7 +250,7 @@ crosses the `Publishes` edge for tables in the list.
 publishes = ["out-topic"]
 
 [risk-service.provenance]
-"DEV-OUTBOUND-POSTRMS" = ["order", "trade"]
+"out-topic" = ["order", "trade"]
 ```
 
 - **Non-empty list = whitelist** → tables outside the list do NOT flow to this topic's consumers.
