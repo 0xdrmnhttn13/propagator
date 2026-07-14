@@ -2,7 +2,7 @@
 
 **Dependency & message-flow tracing for trading infrastructure — right from your editor.**
 
-> If I change `USP_NEW_ORDER_V16`, what breaks? Propagator answers that
+> If I change `some_function`, what breaks? Propagator answers that
 > question without you opening six repositories and tracing call chains
 > by hand.
 
